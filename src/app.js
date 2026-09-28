@@ -22,6 +22,11 @@ import {
   MAX_FRAGMENT_BASE64_LENGTH,
 } from './assemble.js';
 import {
+  checkCacheIntegrity,
+  MAX_FRAGMENTS as MAX_INTEGRITY_FRAGMENTS,
+  MAX_BLOCK_COUNT,
+} from './cache-integrity.js';
+import {
   planCacheRetention,
   MAX_CACHED_INTERVALS,
   MAX_ACCESS_INTERVALS,
@@ -116,6 +121,31 @@ const assembleBodySchema = {
     fragments: {
       type: 'array',
       maxItems: MAX_FRAGMENTS,
+      items: fragmentSchema,
+    },
+  },
+};
+
+const cacheIntegrityBodySchema = {
+  type: 'object',
+  required: ['size', 'blockBytes', 'blockHashes', 'fragments'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    blockBytes: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+    blockHashes: {
+      type: 'array',
+      maxItems: MAX_BLOCK_COUNT,
+      items: {
+        type: 'string',
+        minLength: 64,
+        maxLength: 64,
+        pattern: '^[0-9a-f]{64}$',
+      },
+    },
+    fragments: {
+      type: 'array',
+      maxItems: MAX_INTEGRITY_FRAGMENTS,
       items: fragmentSchema,
     },
   },
@@ -295,6 +325,23 @@ export function buildApp(config = {}) {
         transferSizeRatio,
       });
 
+      return reply.status(result.statusCode).send(result);
+    },
+  );
+
+  // Verify a sparse cache against per-block SHA-256 digests: POST
+  // /cache-integrity-check with the resource size, the block size, the
+  // ordered per-block digests and the same {start, dataBase64} fragments as
+  // /assemble-response. Returns the verified/missing/corrupt block indices
+  // and merged refetch ranges; no Range header involved.
+  app.post(
+    '/cache-integrity-check',
+    {
+      schema: { body: cacheIntegrityBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+    },
+    async (request, reply) => {
+      const result = checkCacheIntegrity(request.body);
       return reply.status(result.statusCode).send(result);
     },
   );
