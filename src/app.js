@@ -21,6 +21,7 @@ import {
   MAX_FRAGMENTS,
   MAX_FRAGMENT_BASE64_LENGTH,
 } from './assemble.js';
+import { checkCacheIntegrity, MAX_BLOCK_DIGEST_LENGTH } from './cache-integrity.js';
 import {
   planCacheRetention,
   MAX_CACHED_INTERVALS,
@@ -113,6 +114,30 @@ const assembleBodySchema = {
   properties: {
     size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
     contentType: { type: 'string', minLength: 1, maxLength: 255 },
+    fragments: {
+      type: 'array',
+      maxItems: MAX_FRAGMENTS,
+      items: fragmentSchema,
+    },
+  },
+};
+
+const cacheIntegrityBodySchema = {
+  type: 'object',
+  required: ['size', 'blockBytes', 'digests', 'fragments'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    blockBytes: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+    digests: {
+      type: 'array',
+      items: {
+        type: 'string',
+        pattern: '^[0-9a-f]{64}$',
+        minLength: MAX_BLOCK_DIGEST_LENGTH,
+        maxLength: MAX_BLOCK_DIGEST_LENGTH,
+      },
+    },
     fragments: {
       type: 'array',
       maxItems: MAX_FRAGMENTS,
@@ -295,6 +320,25 @@ export function buildApp(config = {}) {
         transferSizeRatio,
       });
 
+      return reply.status(result.statusCode).send(result);
+    },
+  );
+
+  // Cache integrity verification: POST /cache-integrity-check with a block
+  // manifest (size, blockBytes, per-block SHA-256 digests) and sparse cached
+  // fragments in the same shape as /assemble-response. No Range header.
+  app.post(
+    '/cache-integrity-check',
+    {
+      schema: { body: cacheIntegrityBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+      // A 1 MiB resource verified with small blocks can carry thousands of
+      // 64-char digests plus the fragments; keep this route's ceiling above
+      // the framework default while the semantic checks stay at 1 MiB.
+      bodyLimit: 4 * 1024 * 1024,
+    },
+    async (request, reply) => {
+      const result = checkCacheIntegrity(request.body);
       return reply.status(result.statusCode).send(result);
     },
   );

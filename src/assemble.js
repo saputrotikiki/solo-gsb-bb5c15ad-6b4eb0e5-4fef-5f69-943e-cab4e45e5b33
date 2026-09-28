@@ -130,7 +130,7 @@ export function assembleResponse(options) {
  * fragment must lie fully inside the resource and carry at least one byte;
  * together they may not exceed the 1 MiB decoded-input budget.
  */
-function decodeFragments(fragments, size) {
+export function decodeFragments(fragments, size) {
   if (!Array.isArray(fragments)) {
     return {
       error: fail(400, 'INVALID_FRAGMENTS', 'fragments must be an array of {start, dataBase64} objects'),
@@ -202,7 +202,7 @@ function decodeFragments(fragments, size) {
  * input, illegal characters, missing/extra padding or any non-canonical
  * quantum (round-tripping through Node's lenient decoder detects the rest).
  */
-function decodeBase64(value) {
+export function decodeBase64(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length % 4 !== 0) return null;
   if (!BASE64_RE.test(value)) return null;
   const buffer = Buffer.from(value, 'base64');
@@ -219,7 +219,7 @@ function decodeBase64(value) {
  * transitive, so comparing each fragment against the canonical bytes of its
  * predecessors detects every pairwise disagreement.
  */
-function buildCache(fragments) {
+export function buildCache(fragments) {
   const sorted = fragments.slice().sort((a, b) => a.start - b.start || a.end - b.end);
   const intervals = [];
   const conflicts = [];
@@ -290,7 +290,7 @@ function collectConflicts(conflicts, current, fragment, overlapEnd) {
  * Read [start, end] from the canonical cache, slicing across as many cached
  * intervals as the range spans. Callers must have verified coverage first.
  */
-function readRange(intervals, start, end) {
+export function readRange(intervals, start, end) {
   const chunks = [];
   for (const interval of intervals) {
     if (interval.end < start) continue;

@@ -18,6 +18,12 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 区间，校验片段一致性与覆盖完整性后，**只从缓存字节**拼出源站应有的原始
 响应体（单段或 `multipart/byteranges`），连同状态码与响应头一并返回。
 
+`POST /cache-integrity-check` 用于校验稀疏缓存的**完整性**：提交资源
+`size`、`blockBytes`、按块顺序排列的每块 SHA-256 十六进制摘要，以及与
+`/assemble-response` 同结构的稀疏片段；服务合并片段（重叠处字节必须一致），
+逐块判定为 `verified` / `missing` / `corrupt`，并返回需重新下载的字节
+闭区间 `refetchRanges`（见下文）。
+
 `POST /cache-retention-plan` 解决缓存淘汰规划：上报已有缓存区间、预计访问
 区间（各带正整数权重）与字节预算，重叠缓存只计一次、重叠访问权重按字节
 累加，仅保留缓存中**正价值**的字节，按"每字节累计权重降序、偏移升序"选满
@@ -374,6 +380,114 @@ curl -X POST http://localhost:3000/assemble-response \
 `--boundary--` CRLF），段顺序与规划顺序一致（保持各区间首次出现的顺序，
 不一定是偏移升序）。
 
+### `POST /cache-integrity-check`（稀疏缓存完整性校验）
+
+客户端持有资源的**稀疏缓存字节**，并知道资源按固定大小分块后**每块的
+SHA-256 摘要**。服务合并片段（规则与 `/assemble-response` 相同），逐块
+判定缓存可信、缺失或损坏，并给出需要重新下载的字节区间。本接口不涉及
+`Range` 请求头。
+
+请求体：
+
+| 字段         | 类型    | 必填 | 说明                                                         |
+| ------------ | ------- | ---- | ------------------------------------------------------------ |
+| `size`       | integer | 是   | 资源总字节数，非负安全整数，且 **≤ 1 MiB**（1048576）        |
+| `blockBytes` | integer | 是   | 块大小（字节），正安全整数（≥ 1）；除最后一块外每块均为该大小，最后一块为剩余字节 |
+| `digests`    | array   | 是   | 按块顺序排列的 SHA-256 摘要，数量必须**恰好等于** `ceil(size/blockBytes)`；每项为 **64 位小写十六进制**字符串（如 `"9f86d081…"`，不接受大写） |
+| `fragments`  | array   | 是   | 缓存片段数组（≤ 1024 项），结构与 `/assemble-response` 完全相同：每项 `{"start":…,"dataBase64":…}`，`dataBase64` 为规范标准 base64（规范 `=` 填充、非空）；片段必须**完整落在资源内**，全部解码后合计 **≤ 1 MiB** |
+
+片段合并与冲突规则与 `/assemble-response` 相同：重叠处字节相同可共存
+（相邻片段自动拼接）；重叠处**字节不同**则把冲突位置涉及的**每个块**记为
+`corrupt`（即使该块缓存完整也不再计算摘要）。
+
+逐块分类（块 `i` 覆盖字节 `[i*blockBytes, min((i+1)*blockBytes, size) - 1]`）：
+
+1. **corrupt（损坏）**：片段冲突区间触及该块；或缓存完整覆盖该块，但算出的
+   SHA-256 与提交的摘要不一致。
+2. **missing（缺失）**：无冲突触及，但缓存**未覆盖**该块的每个字节（不足一
+   整块，无法计算摘要）。
+3. **verified（已验证）**：完整覆盖、无冲突且 SHA-256 与摘要一致。
+
+响应（`200`）字段：
+
+| 字段            | 说明                                                         |
+| --------------- | ------------------------------------------------------------ |
+| `blocksCount`   | 块总数，恒等于 `ceil(size/blockBytes)`                       |
+| `verified`      | 已验证块的**索引**数组（升序）                               |
+| `missing`       | 缺失块的索引数组（升序）                                     |
+| `corrupt`       | 损坏块的索引数组（升序）                                     |
+| `refetchRanges` | 由全部 `missing` / `corrupt` 块的字节区间合并而成的**闭区间**（相邻块合并为一段，按起点升序、互不相交），可直接据此发起 Range 重新下载 |
+
+空资源（`size: 0`）要求 `digests: []`，返回 `blocksCount: 0`、各状态数组与
+`refetchRanges` 均为空。
+
+任何非法字段或数值都返回 `400`，错误码包括：`INVALID_SIZE`、
+`RESOURCE_TOO_LARGE`（size 超过 1 MiB）、`INVALID_BLOCK_BYTES`、
+`INVALID_DIGESTS`、`INVALID_DIGEST_COUNT`（数量不等于
+`ceil(size/blockBytes)`）、`INVALID_DIGEST`（不是 64 位小写十六进制）、
+`INVALID_FRAGMENT`、`INVALID_FRAGMENT_BASE64`、`FRAGMENT_OUT_OF_BOUNDS`、
+`FRAGMENTS_TOO_LARGE`、`TOO_MANY_FRAGMENTS`、`INVALID_FRAGMENTS`；多余字段
+同样 `400`（严格校验器，不做类型强转）。
+
+示例（300 字节资源、3 个 100 字节块；块 0 完整且摘要相符 → verified，块 1
+完整但提交的摘要不符 → corrupt，块 2 无任何片段 → missing；后两块相邻，
+`refetchRanges` 合并为 `[100,299]`）：
+
+```bash
+python3 - <<'PY'
+import base64, hashlib, json, urllib.request
+
+def span(start, length):
+    return bytes((start + i) % 251 for i in range(length))
+
+size, block = 300, 100
+data = span(0, 200)                      # 只缓存 [0,199]
+digests = [
+    hashlib.sha256(span(0, 100)).hexdigest(),  # 块 0：正确摘要
+    "a" * 64,                                  # 块 1：错误摘要
+    "b" * 64,                                  # 块 2：缓存缺失，摘要不会被使用
+]
+payload = {"size": size, "blockBytes": block, "digests": digests,
+           "fragments": [{"start": 0, "dataBase64": base64.b64encode(data).decode()}]}
+req = urllib.request.Request("http://localhost:3000/cache-integrity-check",
+                             data=json.dumps(payload).encode(),
+                             headers={"Content-Type": "application/json"})
+print(urllib.request.urlopen(req).read().decode())
+PY
+```
+
+响应：
+
+```json
+{
+  "statusCode": 200,
+  "blocksCount": 3,
+  "verified": [0],
+  "missing": [2],
+  "corrupt": [1],
+  "refetchRanges": [{ "start": 100, "end": 299 }]
+}
+```
+
+重叠片段字节冲突的例子：两片在字节 50 处不一致，冲突区间 `[50,50]` 落在
+块 0 内，于是块 0 直接记为 corrupt（不再比对摘要）：
+
+```bash
+curl -s -X POST http://localhost:3000/cache-integrity-check \
+  -H 'Content-Type: application/json' \
+  -d '{"size":400,"blockBytes":100,"digests":["<sha256(block0)>","<sha256(block1)>","<sha256(block2)>","<sha256(block3)>"],"fragments":[{"start":0,"dataBase64":"..."},{"start":50,"dataBase64":"..."}]}'
+```
+
+非法输入示例（摘要数量应为 `ceil(100/64)=2`，此处为空 → 400）：
+
+```bash
+curl -i -X POST http://localhost:3000/cache-integrity-check \
+  -H 'Content-Type: application/json' \
+  -d '{"size":100,"blockBytes":64,"digests":[],"fragments":[]}'
+# HTTP/1.1 400 Bad Request
+# {"statusCode":400,"code":"INVALID_DIGEST_COUNT",...}
+```
+
 ### `POST /cache-retention-plan`（缓存保留规划）
 
 面向缓存淘汰场景：客户端上报**已有缓存**的字节区间、**预计访问**的区间
@@ -571,8 +685,9 @@ src/
   resume.js         # 断点续传缺口规划：区间归并、缺口计算、按 chunkBytes/limit 拆分
   multipart-check.js # multipart/byteranges 报文核验：boundary 解析、严格分段、Content-Range 核算、区间归并/差集
   assemble.js       # 稀疏缓存拼装：片段校验、重叠冲突检测、覆盖核算、单段/multipart 报文生成
+  cache-integrity.js # 稀疏缓存完整性校验：片段合并、逐块 SHA-256 比对、verified/missing/corrupt 分类、重取区间合并
   cache-retention.js # 缓存保留规划：缓存归并、访问权重扫描线累加、按权重/偏移选满预算、截断与归并
-  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-retention-plan、/healthz、输入校验
+  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、/healthz、输入校验
   server.js         # 启动入口与环境变量读取
 test/
   planner.test.js       # 原有 node:test 用例（26 个）
@@ -581,6 +696,7 @@ test/
   resume.test.js        # 断点续传缺口规划用例（24 个）
   multipart-check.test.js # multipart/byteranges 核验用例（32 个）
   assemble.test.js      # 稀疏缓存拼装用例（31 个）
+  cache-integrity.test.js # 稀疏缓存完整性校验用例（30 个）
   cache-retention.test.js # 缓存保留规划用例（29 个）
 ```
 
@@ -588,7 +704,7 @@ test/
 
 ```bash
 npm ci
-npm test          # 180 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存保留规划
+npm test          # 210 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划
 npm start
 ```
 
@@ -622,6 +738,14 @@ npm start
   重叠片段字节不一致（`409 FRAGMENT_CONFLICT`）或覆盖不完整
   （`409 INCOMPLETE_COVERAGE`）时不会生成任何响应体；`contentType` 沿用
   `/plan` 的媒体类型与 CR/LF 检查，杜绝响应头注入。
+- `/cache-integrity-check` 同样使用严格校验器：`size` 不得超过 1 MiB
+  （`400 RESOURCE_TOO_LARGE`），`blockBytes` 必须为正安全整数，
+  `digests` 必须是数量恰为 `ceil(size/blockBytes)` 的 64 位**小写**十六进制
+  字符串数组（数量不符 `INVALID_DIGEST_COUNT`、格式不符 `INVALID_DIGEST`），
+  多余字段一律 `400`；片段沿用 `/assemble-response` 的全部校验（规范 base64、
+  完整落在资源内、合计 ≤ 1 MiB、上限 1024 项）。逐块仅在完整覆盖且无冲突时
+  才计算 SHA-256；冲突涉及的块无条件记为 corrupt。为容纳小块资源的大量摘要，
+  该路由的请求体上限单独放宽到 4 MiB（语义上限仍为 1 MiB 资源/1 MiB 片段）。
 - `/cache-retention-plan` 同样使用严格校验器：所有数值必须是安全整数，
   `cached` 与 `accesses` 各上限 1000 项、访问权重上限 100 万，多余字段一律
   `400`；区间必须满足 `0 ≤ start ≤ end < size`；单字节累计权重最高
